@@ -48,12 +48,12 @@ Train ResNet50 on ImageNet-100 (100 classes) optimized for T4 GPU with automatic
 
 ## 💡 **Why This Works**
 - **No manual LR tuning**: LR Finder does it automatically
-- **Strong regularization**: Prevents overfitting (your original issue)
+- **Strong regularization**: Prevents overfitting 
 - **Modern augmentation**: TrivialAugment + Mixup/CutMix
 - **Efficient**: Mixed precision 
 
 
-#LOGS
+# LOGS
 
 ```
 Epoch 1 [Val]: 100%|████████████████████████████████████████████| 40/40 [00:09<00:00,  4.13it/s, loss=4.3098, acc=7.38%]
