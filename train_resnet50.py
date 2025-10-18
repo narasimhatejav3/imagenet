@@ -1,469 +1,557 @@
-"""
-Optimized training script for ImageNet-10 classification with ResNet-50 from scratch.
-All-in-one: data loading, model definition, and training.
-"""
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from torchvision import transforms
-from PIL import Image
-from pathlib import Path
+from torchvision.models import resnet50, ResNet50_Weights
+from datasets import load_dataset
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
 import json
-import time
-from datetime import datetime
 
 
-# ============================================================================
-# ResNet-50 Model (Built from Scratch)
-# ============================================================================
-
-class Bottleneck(nn.Module):
-    """Bottleneck block for ResNet-50."""
-    expansion = 4
-
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
-                               stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion,
-                               kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
-        self.downsample = downsample
-
-    def forward(self, x):
-        identity = x
-
-        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        out = F.relu(self.bn2(self.conv2(out)), inplace=True)
-        out = self.bn3(self.conv3(out))
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = F.relu(out, inplace=True)
-        return out
-
-
-class ResNet50(nn.Module):
-    """ResNet-50 architecture built from scratch."""
-
-    def __init__(self, num_classes=10):
-        super(ResNet50, self).__init__()
-        self.in_channels = 64
-
-        # Initial convolution
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # Residual layers (3, 4, 6, 3 blocks)
-        self.layer1 = self._make_layer(64, 3, stride=1)
-        self.layer2 = self._make_layer(128, 4, stride=2)
-        self.layer3 = self._make_layer(256, 6, stride=2)
-        self.layer4 = self._make_layer(512, 3, stride=2)
-
-        # Classification head
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * Bottleneck.expansion, num_classes)
-
-        # Initialize weights
-        self._initialize_weights()
-
-    def _make_layer(self, out_channels, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.in_channels != out_channels * Bottleneck.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.in_channels, out_channels * Bottleneck.expansion,
-                         kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels * Bottleneck.expansion),
-            )
-
-        layers = []
-        layers.append(Bottleneck(self.in_channels, out_channels, stride, downsample))
-        self.in_channels = out_channels * Bottleneck.expansion
-        for _ in range(1, blocks):
-            layers.append(Bottleneck(self.in_channels, out_channels))
-
-        return nn.Sequential(*layers)
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-
-# ============================================================================
-# Dataset and Data Loading
-# ============================================================================
-
-class ImageNetDataset(Dataset):
-    """ImageNet-10 dataset."""
-
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = Path(root_dir)
+class ImageNetDataset(torch.utils.data.Dataset):
+    def __init__(self, hf_dataset, transform=None):
+        self.dataset = hf_dataset
         self.transform = transform
-        self.samples = []
-        self.class_to_idx = {}
-
-        # Collect samples
-        for idx, class_dir in enumerate(sorted(self.root_dir.iterdir())):
-            if class_dir.is_dir():
-                self.class_to_idx[class_dir.name] = idx
-                for img_path in class_dir.glob('*.JPEG'):
-                    self.samples.append((img_path, idx))
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert('RGB')
+        item = self.dataset[idx]
+        image = item['image'].convert('RGB')
+        label = item['label']
         if self.transform:
             image = self.transform(image)
         return image, label
 
 
-def get_transforms(image_size=224, is_train=True):
-    """
-    Get optimized data transforms for ImageNet.
-
-    Training augmentations based on best practices:
-    - RandomResizedCrop with scale (0.08, 1.0) - standard ImageNet
-    - RandomHorizontalFlip with p=0.5
-    - Moderate ColorJitter for better generalization
-    - RandAugment can be added for more aggressive augmentation
-    - ToTensor and ImageNet normalization
-    """
-    if is_train:
-        return transforms.Compose([
-            transforms.RandomResizedCrop(image_size, scale=(0.08, 1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-            transforms.RandomRotation(15),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-    else:
-        return transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
+class TrivialAugmentWide:
+    def get_transform(self, mode='trivial'):
+        if mode == 'trivial':
+            return transforms.TrivialAugmentWide()
+        elif mode == 'rand':
+            return transforms.RandAugment(num_ops=2, magnitude=9)
+        elif mode == 'auto':
+            return transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.IMAGENET)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
 
-def create_dataloaders(data_dir, batch_size=128, num_workers=4):
-    """Create train and validation dataloaders."""
-    train_dir = Path(data_dir) / 'train'
-    val_dir = Path(data_dir) / 'val'
-
-    train_dataset = ImageNetDataset(train_dir, get_transforms(is_train=True))
-    val_dataset = ImageNetDataset(val_dir, get_transforms(is_train=False))
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                             num_workers=num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                           num_workers=num_workers, pin_memory=True)
-
-    num_classes = len(train_dataset.class_to_idx)
-
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-    print(f"Number of classes: {num_classes}")
-
-    return train_loader, val_loader, num_classes
+def get_transforms(augmentation_mode='trivial', img_size=224):
+    aug_helper = TrivialAugmentWide()
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        aug_helper.get_transform(augmentation_mode),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.25),
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    return train_transform, val_transform
 
 
-# ============================================================================
-# Training Functions
-# ============================================================================
+class Mixup:
+    def __init__(self, alpha=0.2):
+        self.alpha = alpha
 
-def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch):
-    """Train for one epoch."""
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc=f'Epoch {epoch:02d} [Train]')
-    for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-
-        # Step scheduler per batch if OneCycle
-        if scheduler is not None and isinstance(scheduler, OneCycleLR):
-            scheduler.step()
-
-        running_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        pbar.set_postfix({
-            'loss': f'{running_loss/len(pbar):.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-
-    return running_loss / len(loader), 100. * correct / total
+    def __call__(self, batch, labels):
+        if self.alpha > 0:
+            lam = np.random.beta(self.alpha, self.alpha)
+        else:
+            lam = 1
+        batch_size = batch.size(0)
+        index = torch.randperm(batch_size).to(batch.device)
+        mixed_batch = lam * batch + (1 - lam) * batch[index]
+        labels_a, labels_b = labels, labels[index]
+        return mixed_batch, labels_a, labels_b, lam
 
 
-def validate(model, loader, criterion, device, epoch):
-    """Validate the model."""
-    model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+class CutMix:
+    def __init__(self, alpha=1.0):
+        self.alpha = alpha
 
-    with torch.no_grad():
-        pbar = tqdm(loader, desc=f'Epoch {epoch:02d} [Val]  ')
-        for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+    def __call__(self, batch, labels):
+        lam = np.random.beta(self.alpha, self.alpha)
+        batch_size = batch.size(0)
+        index = torch.randperm(batch_size).to(batch.device)
+        _, _, h, w = batch.size()
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(w * cut_rat)
+        cut_h = int(h * cut_rat)
+        cx = np.random.randint(w)
+        cy = np.random.randint(h)
+        bbx1 = np.clip(cx - cut_w // 2, 0, w)
+        bby1 = np.clip(cy - cut_h // 2, 0, h)
+        bbx2 = np.clip(cx + cut_w // 2, 0, w)
+        bby2 = np.clip(cy + cut_h // 2, 0, h)
+        batch[:, :, bby1:bby2, bbx1:bbx2] = batch[index, :, bby1:bby2, bbx1:bbx2]
+        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (w * h))
+        labels_a, labels_b = labels, labels[index]
+        return batch, labels_a, labels_b, lam
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
 
+class LRFinder:
+    def __init__(self, model, optimizer, criterion, device):
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.device = device
+        self.model_state = model.state_dict()
+        self.optimizer_state = optimizer.state_dict()
+
+    def range_test(self, train_loader, start_lr=1e-7, end_lr=10, num_iter=100, smooth_f=0.05, diverge_th=5):
+        self.model.load_state_dict(self.model_state)
+        self.optimizer.load_state_dict(self.optimizer_state)
+        lrs = []
+        losses = []
+        best_loss = float('inf')
+        lr_mult = (end_lr / start_lr) ** (1 / num_iter)
+        lr = start_lr
+        self.optimizer.param_groups[0]['lr'] = lr
+        iterator = iter(train_loader)
+        smoothed_loss = 0
+        print("\n🔍 Running LR Finder...")
+        progress_bar = tqdm(range(num_iter), desc="LR Range Test")
+        for iteration in progress_bar:
+            try:
+                inputs, labels = next(iterator)
+            except StopIteration:
+                iterator = iter(train_loader)
+                inputs, labels = next(iterator)
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+            self.optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, labels)
+            loss.backward()
+            self.optimizer.step()
+            lrs.append(lr)
+            lr *= lr_mult
+            self.optimizer.param_groups[0]['lr'] = lr
+            current_loss = loss.item()
+            if iteration == 0:
+                smoothed_loss = current_loss
+            else:
+                smoothed_loss = smooth_f * current_loss + (1 - smooth_f) * smoothed_loss
+            losses.append(smoothed_loss)
+            best_loss = min(best_loss, smoothed_loss)
+            progress_bar.set_postfix({'lr': f'{lr:.2e}', 'loss': f'{smoothed_loss:.4f}'})
+            if smoothed_loss > diverge_th * best_loss:
+                print(f"\n⚠️  Stopping early - loss diverged at lr={lr:.2e}")
+                break
+        suggested_lr = self._find_steepest_descent(lrs, losses)
+        self.model.load_state_dict(self.model_state)
+        self.optimizer.load_state_dict(self.optimizer_state)
+        return lrs, losses, suggested_lr
+
+    def _find_steepest_descent(self, lrs, losses):
+        gradients = np.gradient(losses)
+        min_gradient_idx = np.argmin(gradients)
+        suggested_lr = lrs[min_gradient_idx]
+        min_loss_idx = np.argmin(losses)
+        conservative_lr = lrs[min_loss_idx] / 10
+        print(f"\n📊 LR Finder Results:")
+        print(f"   Steepest descent LR: {suggested_lr:.2e}")
+        print(f"   Conservative LR (min_loss/10): {conservative_lr:.2e}")
+        print(f"   Recommended: Use LR between {conservative_lr:.2e} and {suggested_lr:.2e}")
+        return suggested_lr
+
+    def plot(self, lrs, losses, save_path='lr_finder_plot.png', skip_start=10, skip_end=5):
+        if skip_start >= len(lrs):
+            skip_start = 0
+        if skip_end >= len(lrs):
+            skip_end = 0
+        lrs = lrs[skip_start:-skip_end] if skip_end > 0 else lrs[skip_start:]
+        losses = losses[skip_start:-skip_end] if skip_end > 0 else losses[skip_start:]
+        plt.figure(figsize=(10, 6))
+        plt.plot(lrs, losses)
+        plt.xscale('log')
+        plt.xlabel('Learning Rate')
+        plt.ylabel('Loss')
+        plt.title('LR Finder - Loss vs Learning Rate')
+        plt.grid(True, alpha=0.3)
+        gradients = np.gradient(losses)
+        min_gradient_idx = np.argmin(gradients)
+        plt.axvline(x=lrs[min_gradient_idx], color='r', linestyle='--',
+                   label=f'Steepest descent: {lrs[min_gradient_idx]:.2e}')
+        min_loss_idx = np.argmin(losses)
+        plt.axvline(x=lrs[min_loss_idx], color='g', linestyle='--',
+                   label=f'Min loss: {lrs[min_loss_idx]:.2e}')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"📈 LR Finder plot saved to {save_path}")
+        plt.close()
+
+
+class Trainer:
+    def __init__(self, model, train_loader, val_loader, criterion, optimizer, device, output_dir='outputs',
+                 use_amp=True, mixup_alpha=0.2, cutmix_alpha=1.0, mixup_prob=0.5):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.device = device
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+        self.use_amp = use_amp
+        self.scaler = GradScaler() if use_amp else None
+        self.mixup = Mixup(alpha=mixup_alpha) if mixup_alpha > 0 else None
+        self.cutmix = CutMix(alpha=cutmix_alpha) if cutmix_alpha > 0 else None
+        self.mixup_prob = mixup_prob
+        self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'lrs': []}
+
+    def mixup_criterion(self, pred, labels_a, labels_b, lam):
+        return lam * self.criterion(pred, labels_a) + (1 - lam) * self.criterion(pred, labels_b)
+
+    def train_epoch(self, epoch, scheduler=None):
+        self.model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        progress_bar = tqdm(self.train_loader, desc=f'Epoch {epoch+1} [Train]')
+        for inputs, labels in progress_bar:
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+            use_mixup_cutmix = (self.mixup is not None or self.cutmix is not None)
+            if use_mixup_cutmix and np.random.rand() < 0.5:
+                if self.mixup and self.cutmix:
+                    if np.random.rand() < self.mixup_prob:
+                        inputs, labels_a, labels_b, lam = self.mixup(inputs, labels)
+                    else:
+                        inputs, labels_a, labels_b, lam = self.cutmix(inputs, labels)
+                elif self.mixup:
+                    inputs, labels_a, labels_b, lam = self.mixup(inputs, labels)
+                else:
+                    inputs, labels_a, labels_b, lam = self.cutmix(inputs, labels)
+                use_mixed_loss = True
+            else:
+                use_mixed_loss = False
+            self.optimizer.zero_grad()
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(inputs)
+                    if use_mixed_loss:
+                        loss = self.mixup_criterion(outputs, labels_a, labels_b, lam)
+                    else:
+                        loss = self.criterion(outputs, labels)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                outputs = self.model(inputs)
+                if use_mixed_loss:
+                    loss = self.mixup_criterion(outputs, labels_a, labels_b, lam)
+                else:
+                    loss = self.criterion(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            if use_mixed_loss:
+                correct += (lam * predicted.eq(labels_a).sum().item() + (1 - lam) * predicted.eq(labels_b).sum().item())
+            else:
+                correct += predicted.eq(labels).sum().item()
+            progress_bar.set_postfix({
+                'loss': f'{running_loss/(progress_bar.n+1):.4f}',
+                'acc': f'{100.*correct/total:.2f}%',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+            })
+        epoch_loss = running_loss / len(self.train_loader)
+        epoch_acc = 100. * correct / total
+        return epoch_loss, epoch_acc
+
+    @torch.no_grad()
+    def validate(self, epoch):
+        self.model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        progress_bar = tqdm(self.val_loader, desc=f'Epoch {epoch+1} [Val]')
+        for inputs, labels in progress_bar:
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+            if self.use_amp:
+                with autocast():
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, labels)
+            else:
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            pbar.set_postfix({
-                'loss': f'{running_loss/len(pbar):.4f}',
+            progress_bar.set_postfix({
+                'loss': f'{running_loss/(progress_bar.n+1):.4f}',
                 'acc': f'{100.*correct/total:.2f}%'
             })
+        epoch_loss = running_loss / len(self.val_loader)
+        epoch_acc = 100. * correct / total
+        return epoch_loss, epoch_acc
 
-    return running_loss / len(loader), 100. * correct / total
+    def fit(self, epochs, scheduler=None):
+        best_acc = 0.0
+        for epoch in range(epochs):
+            train_loss, train_acc = self.train_epoch(epoch, scheduler)
+            val_loss, val_acc = self.validate(epoch)
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['lrs'].append(self.optimizer.param_groups[0]['lr'])
+            print(f"\n📊 Epoch {epoch+1}/{epochs} Summary:")
+            print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+            print(f"   Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+            print(f"   LR: {self.optimizer.param_groups[0]['lr']:.2e}\n")
+            if val_acc > best_acc:
+                best_acc = val_acc
+                self.save_checkpoint(epoch, val_acc, best=True)
+                print(f"✅ New best model saved! Accuracy: {val_acc:.2f}%\n")
+        print(f"\n🎉 Training completed! Best validation accuracy: {best_acc:.2f}%")
+        self.plot_history()
+        return self.history
+
+    def save_checkpoint(self, epoch, accuracy, best=False):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'accuracy': accuracy,
+            'history': self.history
+        }
+        if best:
+            path = self.output_dir / 'best_model.pth'
+        else:
+            path = self.output_dir / f'checkpoint_epoch_{epoch+1}.pth'
+        torch.save(checkpoint, path)
+
+    def plot_history(self):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].plot(self.history['train_loss'], label='Train Loss')
+        axes[0].plot(self.history['val_loss'], label='Val Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title('Training and Validation Loss')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(self.history['train_acc'], label='Train Acc')
+        axes[1].plot(self.history['val_acc'], label='Val Acc')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy (%)')
+        axes[1].set_title('Training and Validation Accuracy')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        axes[2].plot(self.history['lrs'])
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('Learning Rate')
+        axes[2].set_title('Learning Rate Schedule (OneCycleLR)')
+        axes[2].set_yscale('log')
+        axes[2].grid(True, alpha=0.3)
+        plt.tight_layout()
+        save_path = self.output_dir / 'training_history.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"📈 Training history saved to {save_path}")
+        plt.close()
 
 
-def train_resnet50(
-    data_dir='data',
-    epochs=30,
-    batch_size=128,
-    lr=0.001,
-    max_lr=0.01,
-    num_workers=4,
-    output_dir='outputs',
-    use_onecycle=True
-):
-    """
-    Main training function with MPS support and OneCycle LR.
+def main():
+    config = {
+        'batch_size': 128,
+        'num_workers': 4,
+        'img_size': 224,
+        'augmentation_mode': 'trivial',
+        'num_classes': 100,
+        'run_lr_finder': True,
+        'lr_finder_start': 1e-7,
+        'lr_finder_end': 1,
+        'lr_finder_num_iter': 100,
+        'lr_multiplier': 0.5,
+        'epochs': 30,
+        'weight_decay': 2e-4,
+        'label_smoothing': 0.1,
+        'dropout': 0.2,
+        'mixup_alpha': 0.2,
+        'cutmix_alpha': 1.0,
+        'mixup_prob': 0.5,
+        'max_lr': None,
+        'pct_start': 0.3,
+        'div_factor': 25,
+        'final_div_factor': 100,
+        'use_amp': True,
+        'pin_memory': True,
+        'output_dir': 'outputs/imagenet100_t4',
+    }
 
-    Args:
-        data_dir: Path to data directory
-        epochs: Number of training epochs
-        batch_size: Batch size
-        lr: Base learning rate (for OneCycle, this is the initial LR)
-        max_lr: Max learning rate for OneCycle (default: 0.01)
-        num_workers: Number of data loading workers
-        output_dir: Output directory
-        use_onecycle: Use OneCycle LR scheduler (recommended)
-    """
+    print("=" * 80)
+    print("🚀 ResNet50 Training on ImageNet-100 (T4 GPU Optimized)")
+    print("=" * 80)
+    print(f"\n📋 Configuration:")
+    for key, value in config.items():
+        print(f"   {key}: {value}")
+    print()
 
-    # Setup device - support CUDA, MPS (Apple Silicon), and CPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🖥️  Device: {device}")
     if torch.cuda.is_available():
-        device = torch.device('cuda')
-        device_name = torch.cuda.get_device_name(0)
-        device_type = 'CUDA GPU'
-    elif torch.backends.mps.is_available():
-        device = torch.device('mps')
-        device_name = 'Apple Silicon'
-        device_type = 'MPS (Metal Performance Shaders)'
-    else:
-        device = torch.device('cpu')
-        device_name = 'CPU'
-        device_type = 'CPU'
+        print(f"   GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
 
-    print(f"\n{'='*80}")
-    print(f"ResNet-50 Training for ImageNet-10")
-    print(f"{'='*80}")
-    print(f"Device: {device_type}")
-    print(f"Device name: {device_name}")
+    output_dir = Path(config['output_dir'])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load data
-    print(f"\nLoading data from: {data_dir}")
-    train_loader, val_loader, num_classes = create_dataloaders(
-        data_dir, batch_size, num_workers
+    with open(output_dir / 'config.json', 'w') as f:
+        json.dump(config, f, indent=2)
+
+    print("📦 Loading ImageNet-100 dataset from HuggingFace...")
+    dataset = load_dataset("clane9/imagenet-100")
+    print(f"   Train samples: {len(dataset['train'])}")
+    print(f"   Val samples: {len(dataset['validation'])}\n")
+
+    print(f"🎨 Setting up data augmentation: {config['augmentation_mode'].upper()}")
+    train_transform, val_transform = get_transforms(
+        augmentation_mode=config['augmentation_mode'],
+        img_size=config['img_size']
     )
 
-    # Create model
-    print(f"\nCreating ResNet-50 model from scratch...")
-    model = ResNet50(num_classes=num_classes).to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
+    train_dataset = ImageNetDataset(dataset['train'], transform=train_transform)
+    val_dataset = ImageNetDataset(dataset['validation'], transform=val_transform)
 
-    # Optimizer and scheduler
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers'],
+        pin_memory=config['pin_memory'],
+        persistent_workers=True if config['num_workers'] > 0 else False,
+    )
 
-    # OneCycle LR scheduler (recommended for faster convergence)
-    if use_onecycle:
-        steps_per_epoch = len(train_loader)
-        total_steps = epochs * steps_per_epoch
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=max_lr,
-            total_steps=total_steps,
-            pct_start=0.3,  # Warm up for 30% of training
-            anneal_strategy='cos',
-            div_factor=25.0,  # initial_lr = max_lr / div_factor
-            final_div_factor=1e4  # min_lr = initial_lr / final_div_factor
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=config['num_workers'],
+        pin_memory=config['pin_memory'],
+        persistent_workers=True if config['num_workers'] > 0 else False,
+    )
+
+    print(f"   Train batches: {len(train_loader)}")
+    print(f"   Val batches: {len(val_loader)}\n")
+
+    print("🏗️  Building ResNet50 model...")
+    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+
+    if config['dropout'] > 0:
+        model.fc = nn.Sequential(
+            nn.Dropout(p=config['dropout']),
+            nn.Linear(model.fc.in_features, config['num_classes'])
         )
-        scheduler_type = f'OneCycle (max_lr={max_lr})'
+        print(f"   Added dropout: {config['dropout']}")
     else:
-        scheduler = None
-        scheduler_type = 'None'
+        model.fc = nn.Linear(model.fc.in_features, config['num_classes'])
 
-    print(f"Optimizer: SGD (momentum=0.9, weight_decay=1e-4)")
-    print(f"Scheduler: {scheduler_type}")
+    model = model.to(device)
+    print(f"   Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"   Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M\n")
 
-    # Output directory
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_path = Path(output_dir) / f"resnet50_{timestamp}"
-    output_path.mkdir(parents=True, exist_ok=True)
+    criterion = nn.CrossEntropyLoss(label_smoothing=config['label_smoothing'])
 
-    # Save config
-    config = {
-        'model': 'ResNet50',
-        'epochs': epochs,
-        'batch_size': batch_size,
-        'lr': lr,
-        'num_classes': num_classes,
-        'total_params': total_params,
-        'device': str(device)
-    }
-    with open(output_path / 'config.json', 'w') as f:
-        json.dump(config, f, indent=4)
+    if config['run_lr_finder']:
+        print("=" * 80)
+        print("🔍 Step 1: Finding Optimal Learning Rate")
+        print("=" * 80)
+        temp_optimizer = optim.SGD(
+            model.parameters(),
+            lr=config['lr_finder_start'],
+            momentum=0.9,
+            weight_decay=config['weight_decay']
+        )
+        lr_finder = LRFinder(model, temp_optimizer, criterion, device)
+        lrs, losses, suggested_lr = lr_finder.range_test(
+            train_loader,
+            start_lr=config['lr_finder_start'],
+            end_lr=config['lr_finder_end'],
+            num_iter=config['lr_finder_num_iter']
+        )
+        lr_finder.plot(lrs, losses, save_path=str(output_dir / 'lr_finder.png'))
+        config['max_lr'] = suggested_lr * config['lr_multiplier']
+        print(f"\n✅ Found LR: {suggested_lr:.2e}")
+        print(f"✅ Using max_lr = {config['max_lr']:.2e} for OneCycleLR (multiplier: {config['lr_multiplier']})\n")
+    else:
+        config['max_lr'] = 0.1
+        print(f"⚠️  Skipping LR Finder, using default max_lr = {config['max_lr']}\n")
 
-    # Training loop
-    print(f"\nStarting training for {epochs} epochs...")
-    print(f"{'='*80}\n")
+    print("=" * 80)
+    print("🎯 Step 2: Training with OneCycleLR Policy")
+    print("=" * 80)
 
-    best_val_acc = 0.0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': [], 'lr': []}
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=config['max_lr'],
+        momentum=0.9,
+        weight_decay=config['weight_decay']
+    )
 
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
-        current_lr = optimizer.param_groups[0]['lr']
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=config['max_lr'],
+        epochs=config['epochs'],
+        steps_per_epoch=len(train_loader),
+        pct_start=config['pct_start'],
+        div_factor=config['div_factor'],
+        final_div_factor=config['final_div_factor'],
+        anneal_strategy='cos'
+    )
 
-        # Train and validate
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
-        val_loss, val_acc = validate(model, val_loader, criterion, device, epoch)
+    print(f"\n📚 OneCycleLR Schedule:")
+    print(f"   Max LR: {config['max_lr']:.2e}")
+    print(f"   Initial LR: {config['max_lr'] / config['div_factor']:.2e}")
+    print(f"   Final LR: {config['max_lr'] / config['final_div_factor']:.2e}")
+    print(f"   Warmup: {config['pct_start']*100:.0f}% of training")
+    print(f"   Total steps: {config['epochs'] * len(train_loader)}\n")
 
-        # Save history
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-        history['lr'].append(current_lr)
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=device,
+        output_dir=output_dir,
+        use_amp=config['use_amp'],
+        mixup_alpha=config['mixup_alpha'],
+        cutmix_alpha=config['cutmix_alpha'],
+        mixup_prob=config['mixup_prob']
+    )
 
-        # Print summary
-        epoch_time = time.time() - start_time
-        print(f"\nEpoch {epoch}/{epochs} | Time: {epoch_time:.1f}s | LR: {current_lr:.6f}")
-        print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.2f}%")
-        print(f"Val   - Loss: {val_loss:.4f} | Acc: {val_acc:.2f}%")
+    history = trainer.fit(epochs=config['epochs'], scheduler=scheduler)
 
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-            }, output_path / 'best_model.pth')
-            print(f">>> Saved best model: {val_acc:.2f}% <<<")
+    with open(output_dir / 'history.json', 'w') as f:
+        json.dump(history, f, indent=2)
 
-        print(f"{'='*80}\n")
+    print("\n" + "=" * 80)
+    print("✨ Training Complete!")
+    print("=" * 80)
+    print(f"📁 Results saved to: {output_dir}")
+    print(f"   - best_model.pth: Best model checkpoint")
+    print(f"   - lr_finder.png: LR finder plot")
+    print(f"   - training_history.png: Training curves")
+    print(f"   - config.json: Configuration")
+    print(f"   - history.json: Training history")
+    print()
 
-    # Save final model and history
-    torch.save(model.state_dict(), output_path / 'final_model.pth')
-    with open(output_path / 'history.json', 'w') as f:
-        json.dump(history, f, indent=4)
-
-    print(f"\nTraining Complete!")
-    print(f"Best validation accuracy: {best_val_acc:.2f}%")
-    print(f"Models saved to: {output_path}")
-    print(f"{'='*80}\n")
-
-    return output_path, best_val_acc
-
-
-# ============================================================================
-# Main Execution
-# ============================================================================
 
 if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Train ResNet-50 on ImageNet-10 with MPS/CUDA/CPU support and OneCycle LR'
-    )
-    parser.add_argument('--data-dir', type=str, default='data',
-                        help='Path to data directory containing train/val folders (default: data)')
-    parser.add_argument('--epochs', type=int, default=30,
-                        help='Number of training epochs (default: 30)')
-    parser.add_argument('--batch-size', type=int, default=128,
-                        help='Batch size (default: 128)')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Initial learning rate (default: 0.001)')
-    parser.add_argument('--max-lr', type=float, default=0.01,
-                        help='Maximum learning rate for OneCycle (default: 0.01)')
-    parser.add_argument('--use-onecycle', action='store_true', default=True,
-                        help='Use OneCycle LR scheduler (default: True)')
-    parser.add_argument('--no-onecycle', dest='use_onecycle', action='store_false',
-                        help='Disable OneCycle LR scheduler')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of data loading workers (default: 4)')
-    parser.add_argument('--output-dir', type=str, default='outputs',
-                        help='Output directory for models and logs (default: outputs)')
-
-    args = parser.parse_args()
-
-    train_resnet50(
-        data_dir=args.data_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        max_lr=args.max_lr,
-        num_workers=args.num_workers,
-        output_dir=args.output_dir,
-        use_onecycle=args.use_onecycle
-    )
+    main()
