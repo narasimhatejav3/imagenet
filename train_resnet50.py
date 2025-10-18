@@ -480,30 +480,45 @@ class Trainer:
 
 def main():
     config = {
-        'batch_size': 128,
+        # Data & Performance Settings
+        'batch_size': 256,              
         'num_workers': 4,
         'img_size': 224,
-        'augmentation_mode': 'trivial',
+
+        # Augmentation - RandAugment performs better than TrivialAugment
+        'augmentation_mode': 'rand',    
         'num_classes': 100,
-        'run_lr_finder': True,
+
+        # LR Finder (optional)
+        'run_lr_finder': False,
         'lr_finder_start': 1e-7,
         'lr_finder_end': 1,
         'lr_finder_num_iter': 100,
         'lr_multiplier': 0.5,
-        'epochs': 30,
-        'weight_decay': 2e-4,
+
+        # Training Duration - Fast training for quick results
+        'epochs': 30,                   
+
+        # Regularization - Optimized based on research
+        'weight_decay': 2e-4,           
         'label_smoothing': 0.1,
-        'dropout': 0.2,
-        'mixup_alpha': 0.2,
-        'cutmix_alpha': 1.0,
-        'mixup_prob': 0.5,
-        'max_lr': None,
-        'pct_start': 0.3,
+        'dropout': 0.0,
+
+        # Mixup/CutMix - CRITICAL for accuracy boost!
+        'mixup_alpha': 0.2,              
+        'cutmix_alpha': 1.0,             
+        'mixup_prob': 0.5,              
+
+        # OneCycleLR Settings - Higher LR for faster convergence
+        'max_lr': 0.3,                   
+        'pct_start': 0.3,                
         'div_factor': 25,
-        'final_div_factor': 100,
-        'use_amp': True,
+        'final_div_factor': 10000,       
+
+        # Performance Optimizations
+        'use_amp': True,                 
         'pin_memory': True,
-        'output_dir': 'outputs/imagenet100_t4',
+        'output_dir': 'outputs/imagenet100_t4_optimized',
     }
 
     print("=" * 80)
@@ -514,11 +529,18 @@ def main():
         print(f"   {key}: {value}")
     print()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🖥️  Device: {device}")
     if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"🖥️  Device: CUDA")
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB\n")
+    elif torch.backends.mps.is_available():
+        device = torch.device('mps')
+        print(f"🖥️  Device: MPS (Apple Silicon)")
+        print(f"   Using Metal Performance Shaders\n")
+    else:
+        device = torch.device('cpu')
+        print(f"🖥️  Device: CPU\n")
 
     output_dir = Path(config['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -666,3 +688,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
